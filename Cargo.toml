@@ -1,0 +1,21 @@
+[package]
+name = "wallet_intruder"
+authors = ["nomoreqwerty <nomoreqwerty@tuta.io>"]
+repository = "https://github.com/nomoreqwerty/Wallet-Intruder"
+license = "GNU GPLv3"
+version = "0.1.0"
+edition = "2021"
+description = "Bitcoin wallet miner written in Rust (Mining 2.0)"
+
+[dependencies]
+mnemonic = "1.0.1"
+bitcoin = "0.31.1"
+bip0039 = "0.12.0"
+chashmap = "2.2.2"
+sys-info = "0.9.1"
+threadpool = "1.8.1"
+colored = "2.1.0"
+libc = "0.2.153"
+leg = "0.1.2"
+indicatif = "0.17.8"
+time-humanize = "0.1.3"
