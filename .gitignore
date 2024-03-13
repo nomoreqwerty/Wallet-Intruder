@@ -13,3 +13,4 @@ Cargo.lock
 # MSVC Windows builds of rustc generate these, which store debugging information
 *.pdb
 blockchair_bitcoin_addresses_and_balance_LATEST.tsv
+/.idea
