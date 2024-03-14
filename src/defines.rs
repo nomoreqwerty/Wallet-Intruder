@@ -1,3 +1,5 @@
+use tracing::level_filters::LevelFilter;
+
 pub const LOGO: &str = r#"
 M""MMM""MMM""M          dP dP            dP   M""M            dP                           dP
 M  MMM  MMM  M          88 88            88   M  M            88                           88
@@ -9,3 +11,9 @@ MMMMMMMMMMMMMM                                MMMM
 "#;
 
 pub const YELLOW: colored::CustomColor = colored::CustomColor { r: 255, g: 232, b: 0 };
+
+#[cfg(debug_assertions)]
+pub const TRACING_LEVEL: LevelFilter = LevelFilter::TRACE;
+
+#[cfg(not(debug_assertions))]
+pub const TRACING_LEVEL: LevelFilter = LevelFilter::WARN;

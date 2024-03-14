@@ -1,4 +1,8 @@
-use chashmap::CHashMap;
+
+
+use std::path::Path;
+use std::process::exit;
+use hashbrown::HashMap;
 use bitcoin::secp256k1::{All, Secp256k1};
 use std::sync::{
     atomic::{AtomicU32, AtomicU64},
@@ -6,6 +10,10 @@ use std::sync::{
 };
 use indicatif::ProgressStyle;
 use time_humanize::{Accuracy, Tense};
+use hand::*;
+use path_absolutize::Absolutize;
+use thiserror::Error;
+
 
 use crate::{
     common::{
@@ -14,30 +22,43 @@ use crate::{
     },
     wallet::{AddressType, Wallet}
 };
+use crate::defines::TRACING_LEVEL;
 
 pub struct WalletIntruder {
     thread_pool: threadpool::ThreadPool,
-    addresses_map: Option<Arc<CHashMap<String, u64>>>,
+    addresses_map: Option<Arc<HashMap<String, u64>>>,
     paths: Arc<CommonDerivationPaths>,
-    total_checked_wallets: Arc<AtomicU64>,
+    matched_wallets: Arc<AtomicU32>,
+    generated_wallets: Arc<AtomicU64>,
     wallets_per_second: Arc<AtomicU32>,
     secp: Arc<Secp256k1<All>>,
 }
 
 impl WalletIntruder {
-    pub fn main() {
+    pub fn main() -> anyhow::Result<()> {
+        tracing_subscriber::fmt()
+            .with_max_level(TRACING_LEVEL)
+            .init();
+
         clear_command_line_and_print_logo();
 
-        Self::test_writing_to_file();
+        let addresses_file = Path::new("./blockchair_bitcoin_addresses_and_balance_LATEST.tsv")
+            .absolutize()?.to_path_buf();
 
-        let threads = get_user_threads_value();
+        Self::check_addresses_file_exists(addresses_file.as_path())?;
+
+        Self::test_writing_to_file()?;
+
+        let threads = ask_user_threads_amount()?;
 
         Self::new(threads)
-            .read_addresses()
+            .read_addresses(addresses_file.as_path())?
             .pause_for_secs(5)
             .run_stats_displayer(threads)
-            .run_wallet_generators(threads)
+            .run_wallet_generators(threads)?
             .join();
+
+        Ok(())
     }
 
     fn new(cores: usize) -> Self {
@@ -45,7 +66,8 @@ impl WalletIntruder {
             thread_pool: threadpool::ThreadPool::new(cores + 1), // + 1 because of the stats displayer
             addresses_map: None,
             paths: Arc::new(CommonDerivationPaths::new()),
-            total_checked_wallets: Arc::new(AtomicU64::default()),
+            matched_wallets: Arc::new(AtomicU32::default()),
+            generated_wallets: Arc::new(AtomicU64::default()),
             wallets_per_second: Arc::new(AtomicU32::default()),
             secp: Arc::new(Secp256k1::default()),
         }
@@ -55,16 +77,23 @@ impl WalletIntruder {
         self.thread_pool.join();
     }
 
+    fn check_addresses_file_exists(file: &Path) -> Result<(), CheckAddressesFileExist> {
+        if !file.exists() { return Err(CheckAddressesFileExist::AddressesFileDoesNotExist(file.display().to_string())) }
+        Ok(())
+    }
+
     fn run_stats_displayer(self, threads: usize) -> Self {
         clear_command_line_and_print_logo();
 
         let wallets_per_second = self.wallets_per_second.clone();
-        let total_checked_wallets = self.total_checked_wallets.clone();
+        let total_checked_wallets = self.generated_wallets.clone();
+        let matched_wallets = self.matched_wallets.clone();
 
         self.thread_pool.execute(move || {
             routines::StatsDisplayer {
                 total_checked_wallets,
                 wallets_per_second,
+                matched_wallets,
                 threads,
             }
             .run()
@@ -73,59 +102,62 @@ impl WalletIntruder {
         self
     }
 
-    pub fn run_wallet_generators(self, cores: usize) -> Self {
-        for _ in 0..cores {
+    pub fn run_wallet_generators(self, cores: usize) -> Result<Self, GeneratorError> {
+        for id in 0..cores {
             let addresses_map = self.addresses_map.as_ref().unwrap().clone();
             let paths = self.paths.clone();
-            let total_checked_wallets = self.total_checked_wallets.clone();
+            let matched_wallets = self.matched_wallets.clone();
+            let generated_wallets = self.generated_wallets.clone();
             let wallets_per_second = self.wallets_per_second.clone();
             let secp = self.secp.clone();
 
             self.thread_pool.execute(move || {
-                routines::WalletGenerator {
-                    addresses_map,
-                    paths,
-                    total_checked_wallets,
-                    wallets_per_second,
-                    secp,
+                let generator = routines::WalletGenerator::new(
+                    addresses_map, paths, matched_wallets, generated_wallets, wallets_per_second, secp
+                );
+
+                if let Err(error) = generator.run(id as u32) {
+                    tracing::error!("`wallet generator {id}` has failed with error: {error}");
                 }
-                .run()
             });
         }
 
-        self
+        Ok(self)
     }
 
-    fn read_addresses(mut self) -> Self {
-        leg::info("reading the addresses ... ", None, Some(false));
+    fn read_addresses(mut self, file: &Path) -> Result<Self, ReadAddressesError> {
+        let scope = tracing::info_span!("read_addresses");
+
+        scope.in_scope(|| tracing::trace!("started reading the addresses"));
+
+        info!("reading the addresses ... ");
+
         let tracker = TimeTracker::start();
 
-        let file_content =
-            read_file("./blockchair_bitcoin_addresses_and_balance_LATEST.tsv")
-                .expect("Unable to find the `blockchair_bitcoin_addresses_and_balance_LATEST.tsv` file. Download it from http://addresses.loyce.club/ ~ 1.4 GB and put it in the local directory.");
+        let file_content = read_file(file)
+            .map_err(|error| ReadAddressesError::ReadingFileError { file: file.to_str().unwrap_or("none").into(), error })?;
 
         let tracker = tracker.stop();
-        leg::success(
-            &format!("done in {:.2}s", tracker.elapsed().as_secs_f32()),
-            None,
-            None,
-        );
 
-        leg::info("Collecting the addresses ... ", None, Some(false));
+        scope.in_scope(|| tracing::info!("have read addresses in {:.2} secs", tracker.elapsed().as_secs_f32()));
+
+        successln!("done in {:.2}s", tracker.elapsed().as_secs_f32());
+
+        scope.in_scope(|| tracing::trace!("started collecting addresses"));
+
+        info!("Collecting the addresses ... ");
         let tracker = tracker.restart();
 
         self.addresses_map = Some(Arc::new(
-            parse_addresses(&file_content).expect("can't get addresses"),
+            parse_addresses(file_content.trim())
+                .map_err(ReadAddressesError::ParsingAddressesError)?
         ));
 
         let tracker = tracker.stop();
-        leg::success(
-            &format!("done in {:.2}s", tracker.elapsed().as_secs_f32()),
-            None,
-            None,
-        );
 
-        self
+        successln!("done in {:.2}s", tracker.elapsed().as_secs_f32());
+
+        Ok(self)
     }
 
     fn pause_for_secs(self, secs: u64) -> Self {
@@ -148,19 +180,30 @@ impl WalletIntruder {
         self
     }
 
-    fn test_writing_to_file() {
-        leg::info("Testing writing to a file ... ", None, Some(false));
+    fn test_writing_to_file() -> Result<(), std::io::Error> {
+        let file = "./writing_test";
 
-        match test_writing_to_file("./writing_test") {
-            Ok(_) => leg::success("okay", None, None),
-            Err(e) => {
-                warn_user_about_writing_error(e);
-                if ask_user_for_continue() == UserAnswer::No {
-                    panic!("Aborted")
+        match test_writing_to_file(file) {
+            Ok(_) => tracing::info!("successfully tested writing to file"),
+            Err(error) => {
+                tracing::error!("{error}");
+
+                warn_user_about_writing_error();
+
+                if ask_user_for_continue()? == UserAnswer::No {
+                    exit(0);
                 }
             }
         }
+
+        Ok(())
     }
+}
+
+#[derive(Debug, Error)]
+pub enum CheckAddressesFileExist {
+    #[error("`{0}` (bitcoin addresses and balances file) does not exist")]
+    AddressesFileDoesNotExist(String)
 }
 
 mod routines {
@@ -169,14 +212,15 @@ mod routines {
     use std::{
         sync::atomic::Ordering,
         time::Duration,
-        ops::Deref,
     };
+    
 
     use crate::defines::YELLOW;
 
     pub struct StatsDisplayer {
         pub(crate) total_checked_wallets: Arc<AtomicU64>,
         pub(crate) wallets_per_second: Arc<AtomicU32>,
+        pub(crate) matched_wallets: Arc<AtomicU32>,
         pub(crate) threads: usize,
     }
 
@@ -198,7 +242,7 @@ mod routines {
                 std::thread::sleep(Duration::from_secs(1));
 
                 indicator.set_message(format!(
-                    "{} {} {}\n{} {}\n{} {} w/s\n{} {} wallets",
+                    "{} {} {}\n{} {}\n{} {} w/s\n{} {} wallets\n{} {} wallets",
                     "Using".bright_red(),
                     self.threads,
                     "threads".bright_red(),
@@ -207,7 +251,9 @@ mod routines {
                     time_humanize::HumanTime::from(Duration::from_secs(indicator.duration().as_secs())).to_text_en(Accuracy::Precise, Tense::Present),
                     "Speed:".bright_blue(),
                     self.wallets_per_second.load(Ordering::Relaxed),
-                    "Total:".custom_color(YELLOW),
+                    "Found:".bright_green(),
+                    self.matched_wallets.load(Ordering::Relaxed),
+                    "Generated:".custom_color(YELLOW),
                     self.total_checked_wallets.load(Ordering::Relaxed),
                 ));
 
@@ -216,44 +262,134 @@ mod routines {
         }
     }
     pub struct WalletGenerator {
-        pub(crate) addresses_map: Arc<CHashMap<String, u64>>,
+        pub(crate) addresses_map: Arc<HashMap<String, u64>>,
         pub(crate) paths: Arc<CommonDerivationPaths>,
-        pub(crate) total_checked_wallets: Arc<AtomicU64>,
+        pub(crate) matched_wallets: Arc<AtomicU32>,
+        pub(crate) generated_wallets: Arc<AtomicU64>,
         pub(crate) wallets_per_second: Arc<AtomicU32>,
         pub(crate) secp: Arc<Secp256k1<All>>,
     }
 
     impl WalletGenerator {
-        pub fn run(&self) {
-            loop {
-                let wallet = Wallet::generate(&self.paths, &self.secp);
-
-                if let Some(balance) = self.addresses_map.get(wallet.bip44_addr.as_str()) {
-                    append_wallet_to_file(
-                        "./found_wallets.txt",
-                        &wallet.mnemonic,
-                        *balance.deref(),
-                    );
-                    print_found_wallet(AddressType::BIP44, &wallet, *balance.deref());
-                } else if let Some(balance) = self.addresses_map.get(wallet.bip49_addr.as_str()) {
-                    append_wallet_to_file(
-                        "./found_wallets.txt",
-                        &wallet.mnemonic,
-                        *balance.deref(),
-                    );
-                    print_found_wallet(AddressType::BIP49, &wallet, *balance.deref());
-                } else if let Some(balance) = self.addresses_map.get(wallet.bip84_addr.as_str()) {
-                    append_wallet_to_file(
-                        "./found_wallets.txt",
-                        &wallet.mnemonic,
-                        *balance.deref(),
-                    );
-                    print_found_wallet(AddressType::BIP84, &wallet, *balance.deref());
-                }
-
-                self.total_checked_wallets.fetch_add(1, Ordering::Relaxed);
-                self.wallets_per_second.fetch_add(1, Ordering::Relaxed);
+        pub fn new(
+            addresses_map: Arc<HashMap<String, u64>>,
+            paths: Arc<CommonDerivationPaths>,
+            matched_wallets: Arc<AtomicU32>,
+            generated_wallets: Arc<AtomicU64>,
+            wallets_per_second: Arc<AtomicU32>,
+            secp: Arc<Secp256k1<All>>,
+        ) -> Self {
+            Self {
+                addresses_map,
+                paths,
+                matched_wallets,
+                generated_wallets,
+                wallets_per_second,
+                secp,
             }
         }
+
+        pub fn run(&self, thread_id: impl Into<Option<u32>>) -> Result<(), GeneratorError> {
+            let id = thread_id.into().map_or(String::new(), |id| id.to_string());
+
+            let scope = tracing::trace_span!("wallet generator ", id);
+            let _enter = scope.enter();
+
+            let file_save_path = "./found_wallets.txt";
+            let abs_file_path = Path::new(file_save_path)
+                .absolutize()
+                .map_err(|error| GeneratorError::PathAbsoluteizeError {
+                    path: file_save_path.into(),
+                    error
+                })?;
+            let file = abs_file_path.to_path_buf();
+
+            tracing::info!("saving found wallets to `{}`", file.display());
+
+            tracing::info!("start generating");
+
+            loop {
+                let wallet = Wallet::generate(&self.paths, &self.secp)
+                    .map_err(GeneratorError::WalletGeneratingError)?;
+
+                if let Some(balance) = self.addresses_map.get(wallet.p2pkh_addr.as_str()) {
+                    self.process_wallet(file.as_path(), &wallet, *balance, AddressType::BIP44)
+                        .map_err(GeneratorError::WalletProcessingError)?;
+                } else if let Some(balance) = self.addresses_map.get(wallet.p2shwpkh_addr.as_str()) {
+                    self.process_wallet(file.as_path(), &wallet, *balance, AddressType::BIP49)
+                        .map_err(GeneratorError::WalletProcessingError)?;
+                } else if let Some(balance) = self.addresses_map.get(wallet.p2wpkh_addr.as_str()) {
+                    self.process_wallet(file.as_path(), &wallet, *balance, AddressType::BIP84)
+                        .map_err(GeneratorError::WalletProcessingError)?;
+                }
+
+                self.update_counters();
+            }
+        }
+
+        fn process_wallet(&self, file: &Path, wallet: &Wallet, balance: u64, address_type: AddressType) -> Result<(), WalletProcessingError> {
+            tracing::debug!("processing wallet {wallet:?} with balance {balance}");
+
+            append_wallet_to_file(file, &wallet.mnemonic, balance)
+                .map_err(|error| WalletProcessingError::SavingWalletToFileError {
+                    wallet: Box::new(wallet.clone()),
+                    file: file.to_str().unwrap().to_string(),
+                    error
+                })?;
+
+            print_found_wallet(address_type, wallet, balance);
+
+            self.matched_wallets.fetch_add(1, Ordering::Relaxed);
+
+            Ok(())
+        }
+
+        fn update_counters(&self) {
+            self.generated_wallets.fetch_add(1, Ordering::Relaxed);
+            self.wallets_per_second.fetch_add(1, Ordering::Relaxed);
+        }
     }
+}
+
+#[derive(Debug, Error)]
+pub enum WalletProcessingError {
+    #[error("failed to append a wallet to a file `{file}`: {error}")]
+    SavingWalletToFileError {
+        wallet: Box<Wallet>,
+        file: String,
+        error: AppendWalletError,
+    },
+}
+
+#[derive(Debug, Error)]
+pub enum GeneratorError {
+    #[error("failed `{path}` path absolution: {error}")]
+    PathAbsoluteizeError{
+        path: String,
+        error: std::io::Error,
+    },
+
+    #[error("failed to process a wallet: {0}")]
+    WalletProcessingError(#[from] WalletProcessingError),
+
+    #[error("failed to generate a wallet:")]
+    WalletGeneratingError(#[from] bitcoin::bip32::Error),
+}
+
+#[derive(Debug, Error)]
+pub enum ReadAddressesError {
+    #[error("reading `{file}` error: {error}")]
+    ReadingFileError {
+        file: String,
+        error: std::io::Error,
+    },
+
+    #[error("`{path}` absolutizing error: {error}")]
+    PathAbsolutionError {
+        path: String,
+        error: std::io::Error
+    },
+
+    #[error("parsing addresses and balances error: {0}")]
+    ParsingAddressesError(#[from] ParseAddressesError),
 }
