@@ -14,3 +14,4 @@ Cargo.lock
 *.pdb
 blockchair_bitcoin_addresses_and_balance_LATEST.tsv
 /.idea
+/release
